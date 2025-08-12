@@ -8,4 +8,4 @@ YD 可以通过远程 JSON 文件批量应用设置。默认下载地址在 YDCo
         "ExampleKey": true
     }
 }
-mode 字段可选，支持 YD_MODE_PATCH 和 DYYY_MODE_REPLACE，若省略则默认为补丁模式 (YD_MODE_PATCH)。
+mode 字段可选，支持 YD_MODE_PATCH 和 YD_MODE_REPLACE，若省略则默认为补丁模式 (YD_MODE_PATCH)。
