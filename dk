@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+网络验证系统 - 整合版本
+包含验证客户端和演示功能的完整解决方案
+"""
+
+import requests
+import hashlib
+import platform
+import uuid
+import time
+import json
+import threading
+import socket
+import re
+from typing import Dict, Any
+import logging
+
+class VerificationClient:
+    """网络验证客户端"""
+
+    def __init__(self, api_url: str, app_key: str, app_secret: str = ""):
+        """
+        初始化验证客户端
+
+        Args:
+            api_url: API服务器地址
+            app_key: 项目AppKey
+            app_secret: 项目AppSecret（用于签名验证，增强安全性）
+        """
+        self.api_url = api_url.rstrip('/')
+        self.app_key = app_key
+        self.app_secret = app_secret
+        self.session = requests.Session()
+        self.session.timeout = 10
+        self.heartbeat_timer = None
+        self.is_verified = False
+        self.license_key = None
+        self.session_token = None
+
+        # 设置日志
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger(__name__)
+
+        # 如果提供了AppSecret，启用签名验证
+        if self.app_secret:
+            self.logger.info("已启用AppSecret签名验证，增强安全性")
+        else:
+            self.logger.warning("未提供AppSecret，建议启用签名验证以增强安全性")
+        
+    def _get_real_ip(self) -> str:
+        """获取真实的外网IP地址"""
+        try:
+            # 方法1: 通过多个IP查询服务获取外网IP
+            ip_services = [
+                'https://api.ipify.org',
+                'https://icanhazip.com',
+                'https://ident.me',
+                'https://ipecho.net/plain',
+                'https://myexternalip.com/raw',
+                'https://checkip.amazonaws.com',
+                'https://ipv4.icanhazip.com',
+                'https://api.ip.sb/ip',
+                'https://httpbin.org/ip',
+                'http://ip-api.com/line/?fields=query'
+            ]
+
+            self.logger.debug("开始获取外网IP地址...")
+
+            for i, service in enumerate(ip_services):
+                try:
+                    self.logger.debug(f"尝试服务 {i+1}/{len(ip_services)}: {service}")
+
+                    # 设置较短的超时时间，快速失败，禁用代理
+                    response = requests.get(
+                        service,
+                        timeout=3,
+                        proxies={'http': None, 'https': None},  # 禁用代理
+                        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                    )
+                    if response.status_code == 200:
+                        ip_text = response.text.strip()
+
+                        # 处理JSON格式的响应（如httpbin.org）
+                        if service == 'https://httpbin.org/ip':
+                            import json
+                            ip_data = json.loads(ip_text)
+                            ip = ip_data.get('origin', '').split(',')[0].strip()
+                        else:
+                            ip = ip_text
+
+                        # 验证IP格式
+                        if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip):
+                            # 验证IP不是内网地址
+                            ip_parts = ip.split('.')
+                            first_octet = int(ip_parts[0])
+                            second_octet = int(ip_parts[1])
+
+                            # 排除内网IP段
+                            if not (
+                                first_octet == 10 or  # 10.0.0.0/8
+                                (first_octet == 172 and 16 <= second_octet <= 31) or  # 172.16.0.0/12
+                                (first_octet == 192 and second_octet == 168) or  # 192.168.0.0/16
+                                first_octet == 127  # 127.0.0.0/8 (localhost)
+                            ):
+                                self.logger.info(f"成功获取外网IP: {ip} ")
+                                return ip
+                            else:
+                                self.logger.debug(f"跳过内网IP: {ip}")
+
+                except Exception as e:
+                    self.logger.debug(f"服务 {service} 失败: {e}")
+                    continue
+
+           
+
+            # 方法4: 尝试获取默认网关相关的IP
+            self.logger.debug("尝试获取网络配置相关IP...")
+            try:
+                # 在Windows上尝试使用ipconfig命令
+                import subprocess
+                import platform
+
+                if platform.system() == "Windows":
+                    result = subprocess.run(['ipconfig'], capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        lines = result.stdout.split('\n')
+                        for line in lines:
+                            if 'IPv4' in line and ':' in line:
+                                ip = line.split(':')[1].strip()
+                                if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip) and not ip.startswith('127.') and not ip.startswith('169.254.'):
+                                    self.logger.info(f"通过ipconfig获取到IP: {ip}")
+                                    return ip
+                else:
+                    # Linux/Mac系统
+                    result = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        ips = result.stdout.strip().split()
+                        for ip in ips:
+                            if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip) and not ip.startswith('127.') and not ip.startswith('169.254.'):
+                                self.logger.info(f"通过hostname -I获取到IP: {ip}")
+                                return ip
+            except Exception as e:
+                self.logger.debug(f"通过系统命令获取IP失败: {e}")
+
+           
+
+        except Exception as e:
+            self.logger.error(f"获取IP地址时发生严重错误: {e}")
+            return "unknown"
+
+    def _get_mac_address(self) -> str:
+        """获取MAC地址"""
+        try:
+            mac = uuid.getnode()
+            mac_str = ':'.join(['{:02x}'.format((mac >> elements) & 0xff)
+                               for elements in range(0, 2*6, 2)][::-1])
+            return mac_str.upper()
+        except Exception as e:
+            self.logger.warning(f"获取MAC地址失败: {e}")
+            return "unknown"
+
+
+    
+    def _generate_sign(self, license_key: str) -> str:
+        """生成签名"""
+        if not self.app_secret:
+            return ""
+        sign_string = f"{self.app_key}{license_key}{self.app_secret}"
+        return hashlib.md5(sign_string.encode()).hexdigest()
+    
+    def _send_request(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """发送HTTP请求"""
+        try:
+            url = f"{self.api_url}/api/verify.php"
+
+            # 添加通用参数
+            data.update({
+                'app_key': self.app_key
+            })
+
+            # 自动添加客户端IP和MAC地址（如果没有手动指定）
+            if 'client_ip' not in data or not data['client_ip']:
+                data['client_ip'] = self._get_real_ip()
+
+            if 'client_mac' not in data or not data['client_mac']:
+                data['client_mac'] = self._get_mac_address()
+
+            # 添加签名（如果有app_secret）
+            if self.app_secret and 'license_key' in data:
+                data['sign'] = self._generate_sign(data['license_key'])
+
+            self.logger.debug(f"发送请求: {url}")
+            self.logger.debug(f"请求数据: {dict(data, **{'client_ip': data.get('client_ip', 'unknown')[:10] + '...' if len(data.get('client_ip', '')) > 10 else data.get('client_ip', 'unknown')})}")
+
+            response = self.session.post(url, data=data)
+            response.raise_for_status()
+
+            result = response.json()
+            self.logger.debug(f"收到响应: {result}")
+
+            return result
+
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"网络请求失败: {e}")
+            return {'success': False, 'message': f'网络请求失败: {str(e)}'}
+        except json.JSONDecodeError as e:
+            self.logger.error(f"响应解析失败: {e}")
+            return {'success': False, 'message': f'响应解析失败: {str(e)}'}
+        except Exception as e:
+            self.logger.error(f"请求处理失败: {e}")
+            return {'success': False, 'message': f'请求处理失败: {str(e)}'}
+    
+    def verify(self, license_key: str) -> Dict[str, Any]:
+        """
+        验证卡密
+        
+        Args:
+            license_key: 卡密
+            
+        Returns:
+            验证结果字典
+        """
+        data = {
+            'action': 'verify',
+            'license_key': license_key
+        }
+        
+        result = self._send_request(data)
+        
+        if result.get('success'):
+            self.is_verified = True
+            self.license_key = license_key
+            self.session_token = result.get('data', {}).get('session_token')
+            self.logger.info(f"卡密验证成功: {license_key}")
+            if self.session_token:
+                self.logger.info(f"会话令牌已获取，启用安全通信")
+        else:
+            self.is_verified = False
+            self.license_key = None
+            self.session_token = None
+            self.logger.error(f"卡密验证失败: {result.get('message', '未知错误')}")
+        
+        return result
+    
+    def heartbeat(self, license_key: str = None) -> Dict[str, Any]:
+        """
+        发送心跳包
+
+        Args:
+            license_key: 卡密（可选，如果不提供则使用已验证的卡密）
+
+        Returns:
+            心跳结果字典
+        """
+        if not license_key:
+            license_key = self.license_key
+
+        if not license_key:
+            return {'success': False, 'message': '没有可用的卡密'}
+
+        data = {
+            'action': 'heartbeat',
+            'license_key': license_key
+        }
+
+        # 只有在有session_token时才添加
+        if self.session_token:
+            data['session_token'] = self.session_token
+
+        result = self._send_request(data)
+
+        # 打印心跳响应信息
+        if result.get('success'):
+            print(f"✅ 心跳成功")
+            if result.get('data'):
+                response_data = result.get('data', {})
+                if 'server_time' in response_data:
+                    print(f"⏰ 服务器时间: {response_data['server_time']}")
+                if 'session_valid' in response_data:
+                    print(f"🔐 会话状态: {'有效' if response_data['session_valid'] else '无效'}")
+            self.logger.debug(f"心跳包发送成功")
+        else:
+            print(f"❌ 心跳失败: {result.get('message', '未知错误')}")
+            self.logger.warning(f"心跳包发送失败: {result.get('message', '未知错误')}")
+
+            # 任何心跳失败都应该停止客户端（包括网络错误）
+            print(f"🚨 心跳失败，客户端状态已失效")
+            self.logger.error(f"心跳失败，停止客户端: {result.get('message')}")
+            self.is_verified = False
+            self.license_key = None
+            self.session_token = None
+
+        return result
+    
+    def get_project_info(self) -> Dict[str, Any]:
+        """获取项目信息"""
+        data = {
+            'action': 'info',
+            'license_key': 'dummy'  # info接口不需要真实卡密
+        }
+        
+        return self._send_request(data)
+    
+    def get_announcement(self) -> Dict[str, Any]:
+        """获取项目公告"""
+        data = {
+            'action': 'announcement',
+            'license_key': 'dummy'  # announcement接口不需要真实卡密
+        }
+        
+        return self._send_request(data)
+    
+    def start_heartbeat_timer(self, interval: int = 30):
+        """
+        启动心跳定时器
+
+        Args:
+            interval: 心跳间隔（秒），默认30秒
+        """
+        if not self.is_verified or not self.license_key:
+            self.logger.warning("未验证成功，无法启动心跳定时器")
+            return
+
+        def heartbeat_worker():
+            while self.is_verified and self.license_key:
+                try:
+                    result = self.heartbeat()
+                    if not result.get('success'):
+                        self.logger.error(f"心跳失败，停止定时器: {result.get('message')}")
+
+                        # 任何心跳失败都应该停止客户端
+                        print(f"🚨 心跳失败，客户端状态已失效！")
+                        print(f"💬 失败原因: {result.get('message')}")
+                        print(f"🔚 停止心跳定时器...")
+                        self.logger.critical(f"心跳失败，停止客户端: {result.get('message')}")
+
+                        # 设置状态为失效
+                        self.is_verified = False
+                        self.license_key = None
+                        self.session_token = None
+                        break
+                    time.sleep(interval)
+                except Exception as e:
+                    self.logger.error(f"心跳定时器异常: {e}")
+                    print(f"🚨 心跳定时器异常: {e}")
+                    print(f"🔚 客户端状态已失效，停止心跳...")
+                    # 异常也应该停止客户端
+                    self.is_verified = False
+                    self.license_key = None
+                    self.session_token = None
+                    break
+
+        self.heartbeat_timer = threading.Thread(target=heartbeat_worker, daemon=True)
+        self.heartbeat_timer.start()
+        self.logger.info(f"心跳定时器已启动，间隔: {interval}秒")
+    
+    def stop_heartbeat_timer(self):
+        """停止心跳定时器"""
+        self.is_verified = False
+        if self.heartbeat_timer and self.heartbeat_timer.is_alive():
+            self.logger.info("正在停止心跳定时器...")
+            # 等待线程结束
+            self.heartbeat_timer.join(timeout=5)
+    
+
+    
+    def get_client_info(self) -> Dict[str, str]:
+        """
+        获取客户端信息
+
+        Returns:
+            包含客户端信息的字典
+        """
+        return {
+            'client_ip': self._get_real_ip(),
+            'client_mac': self._get_mac_address(),
+            'hostname': platform.node(),
+            'system': platform.system(),
+            'platform': platform.platform()
+        }
+
+    def is_online(self) -> bool:
+        """检查是否在线（已验证且心跳正常）"""
+        return self.is_verified and self.license_key is not None
+
+
+# ==================== 演示功能部分 ====================
+
+# 配置信息
+API_URL = "http://192.168.1.1"
+APP_KEY = "app_355dfa1d873ca578078d27f7ea618728"
+APP_SECRET = "9e0c349bb311ede94399b29ec28f9142da1222b5d47b5715eee7d0199ca33c4e"
+LICENSE_KEY = "433NL9BEGWVLOM3L"  # 测试卡密
+
+# 创建客户端实例
+client = VerificationClient(API_URL, APP_KEY, APP_SECRET)
+
+def get_project_info():
+    """获取项目信息"""
+    print("=" * 50)
+    print("1. 获取项目描述与公告...")
+
+    # 获取项目信息
+    info_result = client.get_project_info()
+    if info_result.get('success'):
+        data = info_result.get('data', {})
+        print(f"✅ 项目名称: {data.get('project_name', '未知')}")
+        print(f"✅ 项目描述: {data.get('project_description', '无描述')}")
+    else:
+        print(f"❌ 获取项目信息失败: {info_result.get('message')}")
+        return False
+
+    # 获取公告
+    announcement_result = client.get_announcement()
+    if announcement_result.get('success'):
+        data = announcement_result.get('data', {})
+        print(f"✅ 项目公告: {data.get('announcement', '无公告')}")
+    else:
+        print(f"❌ 获取公告失败: {announcement_result.get('message')}")
+
+    return True
+
+def verify_license():
+    """验证卡密"""
+    print("=" * 50)
+    print("2. 验证卡密（单卡登录）...")
+
+    result = client.verify(LICENSE_KEY)
+
+    if result.get('success'):
+        data = result.get('data', {})
+        print("✅ 卡密验证成功!")
+        print(f"✅ 卡密: {LICENSE_KEY}")
+        print(f"✅ 到期时间: {data.get('expires_at', '未知')}")
+        print(f"✅ 剩余时长: {data.get('duration_text', '未知')}")
+
+        # 显示到期信息
+        print("=" * 50)
+        print(f"⏰ 卡密到期时间: {data.get('expires_at', '未知')}")
+        print(f"⏳ 剩余时长: {data.get('duration_text', '未知')}")
+
+        return True
+    else:
+        print(f"❌ 卡密验证失败: {result.get('message')}")
+        return False
+
+def send_heartbeat():
+    """发送心跳包"""
+    print("=" * 50)
+    print("3. 发送心跳包（保持登录状态）...")
+
+    result = client.heartbeat()
+
+    if result.get('success'):
+        print("✅ 心跳包发送成功，保持在线")
+        return True
+    else:
+        print(f"❌ 心跳包发送失败: {result.get('message')}")
+        return False
+
+def start_heartbeat_timer(interval=30):
+    """启动自动心跳定时器（后台保持在线）"""
+    print("=" * 50)
+    print(f"启动自动心跳（每{interval}秒一次）...")
+
+    try:
+        client.start_heartbeat_timer(interval=interval)
+        print(f"✅ 自动心跳已启动，将保持卡密在线状态")
+        return True
+    except Exception as e:
+        print(f"❌ 启动心跳定时器失败: {str(e)}")
+        return False
+
+def run_core_demo():
+    """运行核心功能演示流程"""
+    print("=" * 50)
+    print("网络验证系统核心功能演示")
+    print("=" * 50)
+
+    try:
+        # 1. 获取项目信息
+        if not get_project_info():
+            print("⚠️ 获取项目信息失败，演示终止")
+            return
+
+        # 2. 验证卡密
+        if not verify_license():
+            print("⚠️ 卡密验证失败，演示终止")
+            return
+
+        # 3. 发送心跳包
+        if not send_heartbeat():
+            print("⚠️ 心跳包发送失败，但继续演示")
+
+        # 4. 启动自动心跳（30秒间隔）
+        if start_heartbeat_timer(interval=30):
+            print("=" * 50)
+            print(f"🔑 卡密: {LICENSE_KEY}")
+            print("模拟软件运行中... (按Ctrl+C退出)")
+            print("自动心跳将在后台保持卡密在线")
+            print("💡 提示: 程序将保持运行状态，按Ctrl+C退出")
+
+            while True:
+                time.sleep(10)  # 每10秒检查一次状态
+                is_online = client.is_online()
+                print(f"当前在线状态: {'✅ 在线' if is_online else '❌ 离线'}")
+
+                # 如果检测到离线状态，退出程序
+                if not is_online:
+                    print("🚨 检测到客户端已离线，程序即将退出...")
+                    break
+        else:
+            print("⚠️ 自动心跳启动失败，演示终止")
+
+    except KeyboardInterrupt:
+        print("\n🛑 用户中断程序")
+    except Exception as e:
+        print(f"❌ 演示过程中发生错误: {str(e)}")
+    finally:
+        # 清理资源
+        print("🧹 正在清理资源...")
+        client.stop_heartbeat_timer()
+        print("✅ 程序已退出")
+
+def main():
+    """主函数"""
+    print("=" * 50)
+    print("🚀 网络验证系统 - 整合版本")
+    print("=" * 50)
+    print(f"📡 服务器地址: {API_URL}")
+    print(f"🔑 应用密钥: {APP_KEY}")
+    print(f"🎫 测试卡密: {LICENSE_KEY}")
+    print(f"🖥️  设备MAC: {client._get_mac_address()}")
+    print("=" * 50)
+
+    # 运行核心功能演示
+    run_core_demo()
+
+if __name__ == "__main__":
+    main()
